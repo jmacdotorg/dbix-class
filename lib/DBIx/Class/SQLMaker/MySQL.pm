@@ -1,6 +1,9 @@
 package # Hide from PAUSE
   DBIx::Class::SQLMaker::MySQL;
 
+use warnings;
+use strict;
+
 use base qw( DBIx::Class::SQLMaker );
 
 #
@@ -27,6 +30,86 @@ sub _generate_join_clause {
     }
 
     return $self->next::method($join_type);
+}
+
+my $force_double_subq;
+$force_double_subq = sub {
+  my ($self, $sql) = @_;
+
+  require Text::Balanced;
+  my $new_sql;
+  while (1) {
+
+    my ($prefix, $parenthesized);
+
+    ($parenthesized, $sql, $prefix) = do {
+      # idiotic design - writes to $@ but *DOES NOT* throw exceptions
+      local $@;
+      Text::Balanced::extract_bracketed( $sql, '()', qr/[^\(]*/ );
+    };
+
+    # this is how an error is indicated, in addition to crapping in $@
+    last unless $parenthesized;
+
+    if ($parenthesized =~ $self->{_modification_target_referenced_re}) {
+      # is this a select subquery?
+      if ( $parenthesized =~ /^ \( \s* SELECT \s+ /xi ) {
+        $parenthesized = "( SELECT * FROM $parenthesized `_forced_double_subquery` )";
+      }
+      # then drill down until we find it (if at all)
+      else {
+        $parenthesized =~ s/^ \( (.+) \) $/$1/x;
+        $parenthesized = join ' ', '(', $self->$force_double_subq( $parenthesized ), ')';
+      }
+    }
+
+    $new_sql .= $prefix . $parenthesized;
+  }
+
+  return $new_sql . $sql;
+};
+
+sub update {
+  my $self = shift;
+
+  # short-circuit unless understood identifier
+  return $self->next::method(@_) unless $self->{_modification_target_referenced_re};
+
+  # split where from update, do it separately
+  my ($cond) = splice @_, 2, 1, undef;
+  my ($sql, @bind) = $self->next::method(@_);
+
+  if ($sql =~ $self->{_modification_target_referenced_re}) {
+    my ($upd, $set) = $sql =~ /^ \s* (UPDATE \s .+? \s)  (SET \s .+) $/xi;
+    $sql = $upd . $self->$force_double_subq($set);
+  }
+
+  my ($wsql, @wbind);
+  if ($cond) {
+    ($wsql, @wbind) = $self->where($cond);
+    $wsql = $self->$force_double_subq($wsql)
+      if $wsql =~ $self->{_modification_target_referenced_re};
+  }
+
+  return
+    (join ' ', $sql, $wsql||() ),
+    @bind,
+    @wbind
+  ;
+}
+
+sub delete {
+  my $self = shift;
+
+  # short-circuit unless understood identifier
+  return $self->next::method(@_) unless $self->{_modification_target_referenced_re};
+
+  my ($sql, @bind) = $self->next::method(@_);
+
+  $sql = $self->$force_double_subq($sql)
+    if $sql =~ $self->{_modification_target_referenced_re};
+
+  return ($sql, @bind);
 }
 
 # LOCK IN SHARE MODE
